@@ -2,6 +2,31 @@ import math
 import tkinter as tk
 
 
+def vec_sub(v1, v2):
+    return (v1[0] - v2[0], v1[1] - v2[1], v1[2] - v2[2])
+
+
+def vec_dot(v1, v2):
+    return v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]
+
+
+def vec_cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def vec_len(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def vec_norm(v):
+    l = vec_len(v)
+    return (v[0] / l, v[1] / l, v[2] / l) if l > 0 else (0, 0, 0)
+
+
 def carregar_malha(path):
     with open(path, "r", encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
@@ -33,22 +58,14 @@ def carregar_camera(path):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
+            if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = [s.strip() for s in line.split("=", 1)]
-            if k in ("N", "V", "C"):
-                vals = list(map(float, v.split()))
-                if len(vals) != 3:
-                    raise ValueError(f"Parâmetro {k} inválido: '{v}'")
-                data[k] = tuple(vals)
-            elif k in ("d", "hx", "hy"):
-                data[k] = float(v)
-
-    for key in ("N", "V", "C", "d", "hx", "hy"):
-        if key not in data:
-            raise ValueError(f"Parâmetro de câmera ausente: {key}")
+            vals = v.split()
+            if len(vals) > 1:
+                data[k] = tuple(map(float, vals))
+            else:
+                data[k] = float(vals[0])
     return data
 
 
@@ -56,11 +73,7 @@ def normalizar(v):
     x, y, z = v
     n = math.sqrt(x * x + y * y + z * z)
     if n == 0:
-        if z is None:
-            return (0.0, 0.0)
         return (0.0, 0.0, 0.0)
-    if z is None:
-        return (x / n, y / n)
     return (x / n, y / n, z / n)
 
 
@@ -73,20 +86,15 @@ def produto_vetorial(vetor_1, vetor_2):
 
 
 def produto_escalar(vetor_1, vetor_2):
-    result = vetor_1[0] * vetor_2[0] + vetor_1[1] * vetor_2[1] + vetor_1[2] * vetor_2[2]
-    return result
+    return vetor_1[0] * vetor_2[0] + vetor_1[1] * vetor_2[1] + vetor_1[2] * vetor_2[2]
 
 
 def base_coordenadas_camera(N, V):
     v_normalizado = normalizar(V)
     n_normalizado = normalizar(N)
-    resultado = (
-        normalizar(produto_vetorial(v_normalizado, n_normalizado)),
-        v_normalizado,
-        n_normalizado,
-    )
-    print(f"Base da câmera: {resultado}")
-    return resultado
+    U = normalizar(produto_vetorial(v_normalizado, n_normalizado))
+    V_corrigido = produto_vetorial(n_normalizado, U)
+    return (U, V_corrigido, n_normalizado)
 
 
 def converter_global_para_camera(ponto, base_camera, posicao_camera):
@@ -95,12 +103,11 @@ def converter_global_para_camera(ponto, base_camera, posicao_camera):
         ponto[1] - posicao_camera[1],
         ponto[2] - posicao_camera[2],
     )
-    ponto_camera = (
+    return (
         produto_escalar(base_camera[0], ponto_transladado),
         produto_escalar(base_camera[1], ponto_transladado),
         produto_escalar(base_camera[2], ponto_transladado),
     )
-    return ponto_camera
 
 
 def projetar_ponto(ponto_camera, d):
@@ -132,74 +139,117 @@ def interpolacao_linear(y, y0, y1, x0, x1):
     return x0 + ((x1 - x0) * (y - y0)) / (y1 - y0)
 
 
-def scan_line_fill(triangulos, vertices):
-    pixels = set()
+def scan_line_fill(triangulos, vertices_projetados, params, z_buffer_matrix):
+    # Índices: 0=sx, 1=sy, 2=z, 3-5=N, 6-8=PosMundo
 
     for tri in triangulos:
-        v0 = vertices[tri[0]]
-        v1 = vertices[tri[1]]
-        v2 = vertices[tri[2]]
+        v0 = vertices_projetados[tri[0]]
+        v1 = vertices_projetados[tri[1]]
+        v2 = vertices_projetados[tri[2]]
 
-        # ordena por Y crescente
+        if v0 is None or v1 is None or v2 is None:
+            continue
+
+        # Ordena por Y
         V0, V1, V2 = sorted([v0, v1, v2], key=lambda v: v[1])
 
+        # define sub-triangulos
         if V0[1] != V1[1] and V1[1] != V2[1]:
+            # interpolar para o vértice de corte (Vm)
             y_split = V1[1]
-            x_split = interpolacao_linear(y_split, V0[1], V2[1], V0[0], V2[0])
-            Vm = [x_split, y_split]
 
-            # divide em dois sub-triângulos
-            # base plana
-            top_triangle = [V0, V1, Vm]
-            # topo plano
-            bottom_triangle = [V1, Vm, V2]
+            def interp_full(va, vb, y):
+                res = []
+                for i in range(9):
+                    res.append(interpolacao_linear(y, va[1], vb[1], va[i], vb[i]))
+                return tuple(res)
 
-            sub_triangles = [top_triangle, bottom_triangle]
+            Vm = interp_full(V0, V2, y_split)
+            sub_triangles = [[V0, V1, Vm], [V1, Vm, V2]]
         else:
             sub_triangles = [[V0, V1, V2]]
 
         for t in sub_triangles:
-            # ordena vértices por Y
             t = sorted(t, key=lambda v: v[1])
-            V0, V1, V2 = t
+            VA, VB, VC = t[0], t[1], t[2]
 
-            y_start = int(V0[1])
-            y_end = int(V2[1])
+            y_start, y_end = int(VA[1]), int(VC[1])
+            if VB[1] == VC[1]:  # base plana
+                left, right = (VA, VB), (VA, VC)
+            else:  # topo plano
+                left, right = (VA, VC), (VB, VC)
 
-            if V1[1] == V2[1]:
-                # base plana
-                left_start, left_end = V0, V1
-                right_start, right_end = V0, V2
-            else:
-                # topo plano
-                left_start, left_end = V0, V2
-                right_start, right_end = V1, V2
-
-            # percorre cada linha horizontal
             for y in range(y_start, y_end + 1):
-                # calcula X na aresta esquerda e direita
-                x_left = interpolacao_linear(
-                    y, left_start[1], left_end[1], left_start[0], left_end[0]
-                )
-                x_right = interpolacao_linear(
-                    y, right_start[1], right_end[1], right_start[0], right_end[0]
-                )
+                if y < 0 or y >= H:
+                    continue
 
-                # garante ordem correta
-                if x_left > x_right:
-                    x_left, x_right = x_right, x_left
+                # interpola inicio e fim da linha (scanline)
+                def get_val(idx, y_curr, start_v, end_v):
+                    return interpolacao_linear(
+                        y_curr, start_v[1], end_v[1], start_v[idx], end_v[idx]
+                    )
 
-                # preenche pixels da linha
-                for x in range(int(x_left), int(x_right) + 1):
-                    pixels.add((x, y))
+                # calcula X (idx 0)
+                xa = get_val(0, y, left[0], left[1])
+                xb = get_val(0, y, right[0], right[1])
 
-    return pixels
+                # garante ordem
+                if xa > xb:
+                    xa, xb = xb, xa
+                    left, right = (
+                        right,
+                        left,
+                    )
+
+                x_start, x_end = int(xa), int(xb)
+
+                for x in range(x_start, x_end + 1):
+                    if x < 0 or x >= W:
+                        continue
+
+                    # interpola Z (idx 2)
+                    za = get_val(2, y, left[0], left[1])
+                    zb = get_val(2, y, right[0], right[1])
+                    z_pixel = interpolacao_linear(x, xa, xb, za, zb)
+
+                    if z_pixel < z_buffer_matrix[x][y]:
+                        z_buffer_matrix[x][y] = z_pixel
+
+                        # interpola Normal (3,4,5) e PosMundo (6,7,8)
+
+                        def interp_vec(idx_start):
+                            v_a = [
+                                get_val(i, y, left[0], left[1])
+                                for i in range(idx_start, idx_start + 3)
+                            ]
+                            v_b = [
+                                get_val(i, y, right[0], right[1])
+                                for i in range(idx_start, idx_start + 3)
+                            ]
+                            return tuple(
+                                interpolacao_linear(x, xa, xb, v_a[i], v_b[i])
+                                for i in range(3)
+                            )
+
+                        N_pixel = interp_vec(3)
+                        P_pixel = interp_vec(6)
+
+                        # calcula cor e pinta
+                        cor = calcular_phong(P_pixel, N_pixel, params)
+                        set_pixel(x, y, cor)
 
 
 def render_points(parametros_camera, vertices, triangulos):
+    # limpa Z-Buffer
+    global z_buffer
+    z_buffer = [[float("inf")] * H for _ in range(W)]
+
+    normais = calcular_normais_vertices(vertices, triangulos)
     base = base_coordenadas_camera(parametros_camera["N"], parametros_camera["V"])
-    pontos_tela = []
-    for v in vertices:
+
+    vertices_processados = []
+
+    for i, v in enumerate(vertices):
         ponto_camera = converter_global_para_camera(v, base, parametros_camera["C"])
         ponto_projetado = projetar_ponto(ponto_camera, parametros_camera["d"])
         if ponto_projetado is None:
@@ -211,17 +261,72 @@ def render_points(parametros_camera, vertices, triangulos):
         ponto_normalizado = clipar_ponto(ponto_normalizado[0], ponto_normalizado[1])
         if ponto_normalizado is None:
             continue
-        ponto_tela = converter_para_tela(ponto_normalizado, W, H)
-        pontos_tela.append(ponto_tela)
-    pixels = scan_line_fill(triangulos, pontos_tela)
-    print(f"Pixels preenchidos: {len(pixels)}")
-    for p in pixels:
-        set_pixel(p[0], p[1], (255, 255, 255))
-    return pontos_tela
+        tela = converter_para_tela(ponto_normalizado, W, H)
+
+        # (ScreenX, ScreenY, ProfundidadeZ, NormalX, NormalY, NormalZ, WorldX, WorldY, WorldZ)
+        dados_vertice = (
+            tela[0],
+            tela[1],
+            ponto_camera[2],
+            normais[i][0],
+            normais[i][1],
+            normais[i][2],
+            v[0],
+            v[1],
+            v[2],
+        )
+        vertices_processados.append(dados_vertice)
+
+    scan_line_fill(triangulos, vertices_processados, parametros_camera, z_buffer)
+
+
+def calcular_normais_vertices(vertices, triangulos):
+    normais = [(0.0, 0.0, 0.0)] * len(vertices)
+    for tri in triangulos:
+        v0, v1, v2 = vertices[tri[0]], vertices[tri[1]], vertices[tri[2]]
+        # Normal da face
+        edge1 = vec_sub(v1, v0)
+        edge2 = vec_sub(v2, v0)
+        nf = vec_cross(edge1, edge2)
+        # Acumula nos vértices
+        for i in tri:
+            normais[i] = (
+                normais[i][0] + nf[0],
+                normais[i][1] + nf[1],
+                normais[i][2] + nf[2],
+            )
+    return [vec_norm(n) for n in normais]
+
+
+def calcular_phong(P_mundo, N_mundo, params):
+    L = vec_norm(vec_sub(params["Pl"], P_mundo))  # vetor Luz
+    V = vec_norm(vec_sub(params["C"], P_mundo))  # vetor Visão
+    N = vec_norm(N_mundo)
+
+    # Ambiente
+    Iamb, Ka = params["Iamb"], params["Ka"]
+    cor = [Iamb[0] * Ka, Iamb[1] * Ka, Iamb[2] * Ka]
+
+    N_dot_L = vec_dot(N, L)
+    if N_dot_L > 0:
+        # difusa
+        Il, Kd, Od = params["Il"], params["Kd"], params["Od"]
+        for i in range(3):
+            cor[i] += Il[i] * Kd[i] * Od[i] * N_dot_L
+
+        # especular
+        R = vec_sub(tuple(2 * N_dot_L * n for n in N), L)  # R = 2N(N.L) - L
+        R_dot_V = vec_dot(R, V)
+        if R_dot_V > 0:
+            Ks, eta = params["Ks"], params["eta"]
+            spec = Ks * (R_dot_V**eta)
+            for i in range(3):
+                cor[i] += Il[i] * spec
+
+    return (min(255, int(cor[0])), min(255, int(cor[1])), min(255, int(cor[2])))
 
 
 def set_pixel(x: int, y: int, rgb: tuple[int, int, int]):
-    """Desenha UM pixel (x,y) na cor (r,g,b)."""
     if 0 <= x < W and 0 <= y < H:
         r, g, b = rgb
         img.put(f"#{r:02x}{g:02x}{b:02x}", to=(x, y))
@@ -229,40 +334,32 @@ def set_pixel(x: int, y: int, rgb: tuple[int, int, int]):
 
 def refresh_screen():
     global img, lbl
-    new_img = tk.PhotoImage(width=W, height=H)
-    img = new_img
+    img = tk.PhotoImage(width=W, height=H)
+    img.put("#000000", to=(0, 0, W, H))
     lbl.config(image=img)
     lbl.image = img
-    vertices, triangulos = carregar_malha(malha_file)
-    parametros_camera = carregar_camera(camera_file)
-    render_points(parametros_camera, vertices, triangulos)
+    try:
+        vertices, triangulos = carregar_malha(malha_file)
+        parametros_camera = carregar_camera(camera_file)
+        render_points(parametros_camera, vertices, triangulos)
+        print("Render concluído.")
+    except Exception as e:
+        print(f"Erro: {e}")
 
 
-# arquivos de definição
-malha_file = "objetos/vaso.byu"
+malha_file = "objetos/calice2.byu"
 camera_file = "camera.txt"
 W, H = 800, 800
+z_buffer = []
 
-# Carrega a malha e a câmera
-try:
-    vertices, triangulos = carregar_malha(malha_file)
-    print(f"Vértices: {len(vertices)}")
-    print(f"Triângulos: {len(triangulos)}")
-except Exception as e:
-    print(f"Erro ao carregar malha: {e}")
-
-try:
-    parametros_camera = carregar_camera(camera_file)
-    print(f"Parâmetros da Câmera: {parametros_camera}")
-except Exception as e:
-    print(f"Erro ao carregar câmera: {e}")
 root = tk.Tk()
-root.title("Só pixel :)  (stdlib)")
+root.title("2VA - Phong e Z-Buffer")
 img = tk.PhotoImage(width=W, height=H)
 lbl = tk.Label(root, image=img)
 lbl.pack()
 
-pontos_tela = render_points(parametros_camera, vertices, triangulos)
+root.after(100, refresh_screen)
+
 root.bind("<Escape>", lambda e: root.destroy())
 root.bind("<r>", lambda e: refresh_screen())  # 'r' to reload/redraw
 root.mainloop()
